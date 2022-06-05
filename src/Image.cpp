@@ -6,7 +6,7 @@
 #include "Instance.h"
 #include "BufferUtils.h"
 
-void Image::Create(Device* device, uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& imageMemory) {
+void Image::Create(Device* device, uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, uint32_t miplevels, VkImage& image, VkDeviceMemory& imageMemory) {
     // Create Vulkan image
     VkImageCreateInfo imageInfo = {};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -14,7 +14,7 @@ void Image::Create(Device* device, uint32_t width, uint32_t height, VkFormat for
     imageInfo.extent.width = width;
     imageInfo.extent.height = height;
     imageInfo.extent.depth = 1;
-    imageInfo.mipLevels = 1;
+    imageInfo.mipLevels = miplevels;
     imageInfo.arrayLayers = 1;
     imageInfo.format = format;
     imageInfo.tiling = tiling;
@@ -128,7 +128,7 @@ void Image::TransitionLayout(Device* device, VkCommandPool commandPool, VkImage 
     vkFreeCommandBuffers(device->GetVkDevice(), commandPool, 1, &commandBuffer);
 }
 
-VkImageView Image::CreateView(Device* device, VkImage image, VkFormat format, VkImageAspectFlags aspectFlags) {
+VkImageView Image::CreateView(Device* device, VkImage image, VkFormat format, VkImageAspectFlags aspectFlags, uint32_t baseMipLevel, uint32_t levelCount) {
     VkImageViewCreateInfo viewInfo = {};
     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     viewInfo.image = image;
@@ -137,8 +137,8 @@ VkImageView Image::CreateView(Device* device, VkImage image, VkFormat format, Vk
 
     // Describe the image's purpose and which part of the image should be accessed
     viewInfo.subresourceRange.aspectMask = aspectFlags;
-    viewInfo.subresourceRange.baseMipLevel = 0;
-    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.baseMipLevel = baseMipLevel;
+    viewInfo.subresourceRange.levelCount = levelCount;
     viewInfo.subresourceRange.baseArrayLayer = 0;
     viewInfo.subresourceRange.layerCount = 1;
 
@@ -221,7 +221,7 @@ void Image::FromFile(Device* device, VkCommandPool commandPool, const char* path
     stbi_image_free(pixels);
 
     // Create Vulkan image
-    Image::Create(device, texWidth, texHeight, format, tiling, VK_IMAGE_USAGE_TRANSFER_DST_BIT | usage, properties, image, imageMemory);
+    Image::Create(device, texWidth, texHeight, format, tiling, VK_IMAGE_USAGE_TRANSFER_DST_BIT | usage, properties, 1, image, imageMemory);
 
     // Copy the staging buffer to the texture image
     // --> First need to transition the texture image to VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL

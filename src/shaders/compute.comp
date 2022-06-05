@@ -48,6 +48,8 @@ layout(set = 2, binding = 2) buffer NumBlades {
  	uint firstInstance; // = 0
 } numBlades;
 
+layout(set = 2, binding = 3) uniform sampler2D depthPyramid;
+
 bool inBounds(float value, float bounds) {
     return (value >= -bounds) && (value <= bounds);
 }

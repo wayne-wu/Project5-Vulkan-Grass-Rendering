@@ -22,6 +22,9 @@ namespace {
             extensions.push_back(VK_EXT_DEBUG_REPORT_EXTENSION_NAME);
         }
 
+        // This is for occlusion culling / depth reducing
+        extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+
         return extensions;
     }
 

@@ -83,7 +83,7 @@ int main() {
     }
 
     //NOTE: Need to select a physical GPU device to use
-    instance->PickPhysicalDevice({ VK_KHR_SWAPCHAIN_EXTENSION_NAME }, QueueFlagBit::GraphicsBit | QueueFlagBit::TransferBit | QueueFlagBit::ComputeBit | QueueFlagBit::PresentBit, surface);
+    instance->PickPhysicalDevice({ VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_SAMPLER_FILTER_MINMAX_EXTENSION_NAME }, QueueFlagBit::GraphicsBit | QueueFlagBit::TransferBit | QueueFlagBit::ComputeBit | QueueFlagBit::PresentBit, surface);
 
     VkPhysicalDeviceFeatures deviceFeatures = {};
     deviceFeatures.tessellationShader = VK_TRUE;
@@ -134,6 +134,38 @@ int main() {
         { 0, 1, 2, 2, 3, 0 }
     );
     plane->SetTexture(grassImage);
+
+    VkImage brickImage;
+    VkDeviceMemory brickImageMemory;
+    Image::FromFile(device,
+      transferCommandPool,
+      "images/brick.jpg",
+      VK_FORMAT_R8G8B8A8_UNORM,
+      VK_IMAGE_TILING_OPTIMAL,
+      VK_IMAGE_USAGE_SAMPLED_BIT,
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+      brickImage,
+      brickImageMemory
+    );
+
+    halfWidth = 3.f;
+    Model* cube = new Model(device, transferCommandPool,
+        {
+            // front
+            { { -halfWidth, -halfWidth, halfWidth }, { 1.0f, 0.0f, 0.0f },{ 1.0f, 0.0f } },
+            { { halfWidth, -halfWidth, halfWidth }, { 0.0f, 1.0f, 0.0f },{ 0.0f, 0.0f } },
+            { { halfWidth, halfWidth, halfWidth }, { 0.0f, 0.0f, 1.0f },{ 0.0f, 1.0f } },
+            { { -halfWidth, halfWidth, halfWidth }, { 1.0f, 1.0f, 1.0f },{ 1.0f, 1.0f } },
+            // back
+            { { -halfWidth, -halfWidth, -halfWidth }, { 1.0f, 0.0f, 0.0f },{ 1.0f, 1.0f } },
+            { { halfWidth, -halfWidth, -halfWidth }, { 0.0f, 1.0f, 0.0f },{ 0.0f, 1.0f } },
+            { { halfWidth, halfWidth, -halfWidth }, { 0.0f, 0.0f, 1.0f },{ 0.0f, 0.0f } },
+            { { -halfWidth, halfWidth, -halfWidth }, { 1.0f, 1.0f, 1.0f },{ 1.0f, 0.0f } }
+        },
+        { 0, 1, 2, 2, 3, 0, 1, 5, 6, 6, 2, 1, 7, 6, 5, 5, 4, 7, 4, 0, 3, 3, 7, 4, 4, 5, 1, 1, 0, 4, 3, 2, 6, 6, 7, 3 }
+    );
+    cube->SetTexture(brickImage);
     
     // NOTE: Blades class contains ALL blades (i.e. vector is contained within the class)
     Blades* blades = new Blades(device, transferCommandPool, planeDim);
@@ -141,7 +173,9 @@ int main() {
     vkDestroyCommandPool(device->GetVkDevice(), transferCommandPool, nullptr);
 
     Scene* scene = new Scene(device);
+
     scene->AddModel(plane);
+    scene->AddModel(cube);
     scene->AddBlades(blades);
 
     renderer = new Renderer(device, swapChain, scene, camera);
@@ -183,9 +217,12 @@ int main() {
 
     vkDestroyImage(device->GetVkDevice(), grassImage, nullptr);
     vkFreeMemory(device->GetVkDevice(), grassImageMemory, nullptr);
+    vkDestroyImage(device->GetVkDevice(), brickImage, nullptr);
+    vkFreeMemory(device->GetVkDevice(), brickImageMemory, nullptr);
 
     delete scene;
     delete plane;
+    delete cube;
     delete blades;
     delete camera;
     delete renderer;

@@ -20,6 +20,7 @@ public:
     void CreateTimeDescriptorSetLayout();
     void CreateComputeDescriptorSetLayout();
     void CreateGrassDescriptorSetLayout();
+    void CreateDepthReduceDescriptorSetLayout();
 
     void CreateDescriptorPool();
 
@@ -32,6 +33,7 @@ public:
     void CreateGraphicsPipeline();
     void CreateGrassPipeline();
     void CreateComputePipeline();
+    void CreateDepthReducePipeline();
 
     void CreateFrameResources();
     void DestroyFrameResources();
@@ -39,6 +41,7 @@ public:
 
     void RecordCommandBuffers();
     void RecordComputeCommandBuffer();
+    void RecordDepthReduceCommandBuffer();
 
     void Frame();
 
@@ -59,6 +62,7 @@ private:
     VkDescriptorSetLayout timeDescriptorSetLayout;
     VkDescriptorSetLayout grassDescriptorSetLayout;
     VkDescriptorSetLayout computeDescriptorSetLayout;
+    VkDescriptorSetLayout depthReduceDescriptorSetLayout;
     
     VkDescriptorPool descriptorPool;
 
@@ -71,10 +75,12 @@ private:
     VkPipelineLayout graphicsPipelineLayout;
     VkPipelineLayout grassPipelineLayout;
     VkPipelineLayout computePipelineLayout;
+    VkPipelineLayout depthReducePipelineLayout;
 
     VkPipeline graphicsPipeline;
     VkPipeline grassPipeline;
     VkPipeline computePipeline;
+    VkPipeline depthReducePipeline;
 
     std::vector<VkImageView> imageViews;
     VkImage depthImage;
@@ -82,6 +88,17 @@ private:
     VkImageView depthImageView;
     std::vector<VkFramebuffer> framebuffers;
 
+    VkImage depthPyramid;
+    VkDeviceMemory depthPyramidMemory;
+    VkImageView depthPyramidView;
+    VkSampler depthSampler;
+    VkImageView depthPyramidMips[16] = {};
+
+    uint32_t depthPyramidLevels;
+    uint32_t depthPyramidHeight;
+    uint32_t depthPyramidWidth;
+
     std::vector<VkCommandBuffer> commandBuffers;
     VkCommandBuffer computeCommandBuffer;
+    VkCommandBuffer depthReduceCommandBuffer;
 };

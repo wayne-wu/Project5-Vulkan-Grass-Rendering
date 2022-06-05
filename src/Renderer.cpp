@@ -8,6 +8,31 @@
 
 static constexpr unsigned int WORKGROUP_SIZE = 32;
 
+uint32_t previousPow2(uint32_t v)
+{
+  uint32_t r = 1;
+
+  while (r * 2 < v)
+    r *= 2;
+
+  return r;
+}
+
+uint32_t getImageMipLevels(uint32_t width, uint32_t height)
+{
+  uint32_t result = 1;
+
+  while (width > 1 || height > 1)
+  {
+    result++;
+    width /= 2;
+    height /= 2;
+  }
+
+  return result;
+}
+
+
 Renderer::Renderer(Device* device, SwapChain* swapChain, Scene* scene, Camera* camera)
   : device(device),
     logicalDevice(device->GetVkDevice()),
@@ -15,24 +40,31 @@ Renderer::Renderer(Device* device, SwapChain* swapChain, Scene* scene, Camera* c
     scene(scene),
     camera(camera) {
 
+    depthPyramidHeight = previousPow2(swapChain->GetVkExtent().height);
+    depthPyramidWidth = previousPow2(swapChain->GetVkExtent().width);
+    depthPyramidLevels = getImageMipLevels(depthPyramidWidth, depthPyramidHeight);
+
     CreateCommandPools();
     CreateRenderPass();
     CreateCameraDescriptorSetLayout();
     CreateModelDescriptorSetLayout();
     CreateTimeDescriptorSetLayout();
     CreateComputeDescriptorSetLayout();
+    CreateDepthReduceDescriptorSetLayout();
     CreateDescriptorPool();
+    CreateFrameResources();
     CreateCameraDescriptorSet();
     CreateModelDescriptorSets();
     CreateGrassDescriptorSets();
     CreateTimeDescriptorSet();
     CreateComputeDescriptorSets();
-    CreateFrameResources();
     CreateGraphicsPipeline();
     CreateGrassPipeline();
     CreateComputePipeline();
+    CreateDepthReducePipeline();
     RecordComputeCommandBuffer();
     RecordCommandBuffers();
+    RecordDepthReduceCommandBuffer();
 
 }
 
@@ -241,7 +273,14 @@ void Renderer::CreateComputeDescriptorSetLayout() {
     numBladesLayoutBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     numBladesLayoutBinding.pImmutableSamplers = nullptr;
 
-    std::vector<VkDescriptorSetLayoutBinding> bindings = { bladesLayoutBinding, culledBladesLayoutBinding, numBladesLayoutBinding };
+    VkDescriptorSetLayoutBinding depthPyramidLayoutBinding = {};
+    depthPyramidLayoutBinding.binding = 3;
+    depthPyramidLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    depthPyramidLayoutBinding.descriptorCount = 1;
+    depthPyramidLayoutBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    depthPyramidLayoutBinding.pImmutableSamplers = nullptr;
+
+    std::vector<VkDescriptorSetLayoutBinding> bindings = { bladesLayoutBinding, culledBladesLayoutBinding, numBladesLayoutBinding, depthPyramidLayoutBinding };
 
     // Create the descriptor set layout
     VkDescriptorSetLayoutCreateInfo layoutInfo = {};
@@ -250,6 +289,33 @@ void Renderer::CreateComputeDescriptorSetLayout() {
     layoutInfo.pBindings = bindings.data();
 
     if (vkCreateDescriptorSetLayout(logicalDevice, &layoutInfo, nullptr, &computeDescriptorSetLayout) != VK_SUCCESS) {
+      throw std::runtime_error("Failed to create descriptor set layout");
+    }
+}
+
+void Renderer::CreateDepthReduceDescriptorSetLayout() {
+
+    VkDescriptorSetLayoutBinding destImageBinding;
+    destImageBinding.binding = 0;
+    destImageBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    destImageBinding.descriptorCount = 1;
+    destImageBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    destImageBinding.pImmutableSamplers = nullptr;
+
+    VkDescriptorSetLayoutBinding sourceImageBinding;
+    sourceImageBinding.binding = 1;
+    sourceImageBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    sourceImageBinding.descriptorCount = 1;
+    sourceImageBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    sourceImageBinding.pImmutableSamplers = nullptr;
+
+    std::vector<VkDescriptorSetLayoutBinding> bindings = { destImageBinding, sourceImageBinding };
+    VkDescriptorSetLayoutCreateInfo layoutInfo = {};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
+
+    if (vkCreateDescriptorSetLayout(logicalDevice, &layoutInfo, nullptr, &depthReduceDescriptorSetLayout) != VK_SUCCESS) {
       throw std::runtime_error("Failed to create descriptor set layout");
     }
 }
@@ -273,13 +339,18 @@ void Renderer::CreateDescriptorPool() {
     
     // NOTE: Each compute descriptor set has three storage buffers
     { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER , static_cast<uint32_t>(scene->GetBlades().size() * 3) },
+
+    // Depth Reduce
+    { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, depthPyramidLevels + 1},
+
+    { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, depthPyramidLevels + 1}
     };
 
     VkDescriptorPoolCreateInfo poolInfo = {};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
-    poolInfo.maxSets = 5;
+    poolInfo.maxSets = 4 + scene->GetModels().size() + 2 * depthPyramidLevels;  // Each model will have its own descriptor set
 
     if (vkCreateDescriptorPool(logicalDevice, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create descriptor pool");
@@ -325,53 +396,52 @@ void Renderer::CreateModelDescriptorSets() {
     modelDescriptorSets.resize(scene->GetModels().size());
 
     // Describe the desciptor set
-    VkDescriptorSetLayout layouts[] = { modelDescriptorSetLayout };
+    std::vector<VkDescriptorSetLayout> layouts(modelDescriptorSets.size(), modelDescriptorSetLayout);
     VkDescriptorSetAllocateInfo allocInfo = {};
     allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     allocInfo.descriptorPool = descriptorPool;
     allocInfo.descriptorSetCount = static_cast<uint32_t>(modelDescriptorSets.size());
-    allocInfo.pSetLayouts = layouts;
+    allocInfo.pSetLayouts = layouts.data();
 
     // Allocate descriptor sets
     if (vkAllocateDescriptorSets(logicalDevice, &allocInfo, modelDescriptorSets.data()) != VK_SUCCESS) {
         throw std::runtime_error("Failed to allocate descriptor set");
     }
 
-    std::vector<VkWriteDescriptorSet> descriptorWrites(2 * modelDescriptorSets.size());
-
     for (uint32_t i = 0; i < scene->GetModels().size(); ++i) {
-        VkDescriptorBufferInfo modelBufferInfo = {};
-        modelBufferInfo.buffer = scene->GetModels()[i]->GetModelBuffer();
-        modelBufferInfo.offset = 0;
-        modelBufferInfo.range = sizeof(ModelBufferObject);
+      std::vector<VkWriteDescriptorSet> descriptorWrites(2);
 
-        // Bind image and sampler resources to the descriptor
-        VkDescriptorImageInfo imageInfo = {};
-        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        imageInfo.imageView = scene->GetModels()[i]->GetTextureView();
-        imageInfo.sampler = scene->GetModels()[i]->GetTextureSampler();
+      VkDescriptorBufferInfo modelBufferInfo = {};
+      modelBufferInfo.buffer = scene->GetModels()[i]->GetModelBuffer();
+      modelBufferInfo.offset = 0;
+      modelBufferInfo.range = sizeof(ModelBufferObject);
 
-        descriptorWrites[2 * i + 0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        descriptorWrites[2 * i + 0].dstSet = modelDescriptorSets[i];
-        descriptorWrites[2 * i + 0].dstBinding = 0;
-        descriptorWrites[2 * i + 0].dstArrayElement = 0;
-        descriptorWrites[2 * i + 0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        descriptorWrites[2 * i + 0].descriptorCount = 1;
-        descriptorWrites[2 * i + 0].pBufferInfo = &modelBufferInfo;
-        descriptorWrites[2 * i + 0].pImageInfo = nullptr;
-        descriptorWrites[2 * i + 0].pTexelBufferView = nullptr;
+      // Bind image and sampler resources to the descriptor
+      VkDescriptorImageInfo imageInfo = {};
+      imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      imageInfo.imageView = scene->GetModels()[i]->GetTextureView();
+      imageInfo.sampler = scene->GetModels()[i]->GetTextureSampler();
 
-        descriptorWrites[2 * i + 1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        descriptorWrites[2 * i + 1].dstSet = modelDescriptorSets[i];
-        descriptorWrites[2 * i + 1].dstBinding = 1;
-        descriptorWrites[2 * i + 1].dstArrayElement = 0;
-        descriptorWrites[2 * i + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        descriptorWrites[2 * i + 1].descriptorCount = 1;
-        descriptorWrites[2 * i + 1].pImageInfo = &imageInfo;
+      descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      descriptorWrites[0].dstSet = modelDescriptorSets[i];
+      descriptorWrites[0].dstBinding = 0;
+      descriptorWrites[0].dstArrayElement = 0;
+      descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+      descriptorWrites[0].descriptorCount = 1;
+      descriptorWrites[0].pBufferInfo = &modelBufferInfo;
+      descriptorWrites[0].pImageInfo = nullptr;
+      descriptorWrites[0].pTexelBufferView = nullptr;
+
+      descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      descriptorWrites[1].dstSet = modelDescriptorSets[i];
+      descriptorWrites[1].dstBinding = 1;
+      descriptorWrites[1].dstArrayElement = 0;
+      descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+      descriptorWrites[1].descriptorCount = 1;
+      descriptorWrites[1].pImageInfo = &imageInfo;
+
+      vkUpdateDescriptorSets(logicalDevice, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
     }
-
-    // Update descriptor sets
-    vkUpdateDescriptorSets(logicalDevice, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
 }
 
 void Renderer::CreateGrassDescriptorSets() {
@@ -462,7 +532,6 @@ void Renderer::CreateComputeDescriptorSets() {
     allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     allocInfo.descriptorPool = descriptorPool;
     allocInfo.descriptorSetCount = static_cast<uint32_t>(computeDescriptorSets.size());
-    allocInfo.pSetLayouts = layouts;;
     allocInfo.pSetLayouts = layouts;
 
     // Allocate descriptor sets
@@ -470,7 +539,7 @@ void Renderer::CreateComputeDescriptorSets() {
       throw std::runtime_error("Failed to allocate descriptor set");
     }
 
-    std::vector<VkWriteDescriptorSet> descriptorWrites(3 * computeDescriptorSets.size());
+    std::vector<VkWriteDescriptorSet> descriptorWrites(4 * computeDescriptorSets.size());
 
     for (uint32_t i = 0; i < scene->GetBlades().size(); ++i) {
       VkDescriptorBufferInfo bladesBufferInfo = {};
@@ -488,32 +557,44 @@ void Renderer::CreateComputeDescriptorSets() {
       numBladesBufferInfo.offset = 0;
       numBladesBufferInfo.range = sizeof(BladeDrawIndirect);
 
-      descriptorWrites[3 * i + 0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-      descriptorWrites[3 * i + 0].dstSet = computeDescriptorSets[i];
-      descriptorWrites[3 * i + 0].dstBinding = 0;
-      descriptorWrites[3 * i + 0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-      descriptorWrites[3 * i + 0].descriptorCount = 1;
-      descriptorWrites[3 * i + 0].pBufferInfo = &bladesBufferInfo;
-      descriptorWrites[3 * i + 0].pImageInfo = nullptr;
-      descriptorWrites[3 * i + 0].pTexelBufferView = nullptr;
+      VkDescriptorImageInfo depthPyramidInfo = {};
+      depthPyramidInfo.sampler = depthSampler;
+      depthPyramidInfo.imageView = depthPyramidView;
+      depthPyramidInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-      descriptorWrites[3 * i + 1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-      descriptorWrites[3 * i + 1].dstSet = computeDescriptorSets[i];
-      descriptorWrites[3 * i + 1].dstBinding = 1;
-      descriptorWrites[3 * i + 1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-      descriptorWrites[3 * i + 1].descriptorCount = 1;
-      descriptorWrites[3 * i + 1].pBufferInfo = &culledBladesBufferInfo;
-      descriptorWrites[3 * i + 1].pImageInfo = nullptr;
-      descriptorWrites[3 * i + 1].pTexelBufferView = nullptr;
+      descriptorWrites[4 * i + 0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      descriptorWrites[4 * i + 0].dstSet = computeDescriptorSets[i];
+      descriptorWrites[4 * i + 0].dstBinding = 0;
+      descriptorWrites[4 * i + 0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      descriptorWrites[4 * i + 0].descriptorCount = 1;
+      descriptorWrites[4 * i + 0].pBufferInfo = &bladesBufferInfo;
+      descriptorWrites[4 * i + 0].pImageInfo = nullptr;
+      descriptorWrites[4 * i + 0].pTexelBufferView = nullptr;
 
-      descriptorWrites[3 * i + 2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-      descriptorWrites[3 * i + 2].dstSet = computeDescriptorSets[i];
-      descriptorWrites[3 * i + 2].dstBinding = 2;
-      descriptorWrites[3 * i + 2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-      descriptorWrites[3 * i + 2].descriptorCount = 1;
-      descriptorWrites[3 * i + 2].pBufferInfo = &numBladesBufferInfo;
-      descriptorWrites[3 * i + 2].pImageInfo = nullptr;
-      descriptorWrites[3 * i + 2].pTexelBufferView = nullptr;
+      descriptorWrites[4 * i + 1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      descriptorWrites[4 * i + 1].dstSet = computeDescriptorSets[i];
+      descriptorWrites[4 * i + 1].dstBinding = 1;
+      descriptorWrites[4 * i + 1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      descriptorWrites[4 * i + 1].descriptorCount = 1;
+      descriptorWrites[4 * i + 1].pBufferInfo = &culledBladesBufferInfo;
+      descriptorWrites[4 * i + 1].pImageInfo = nullptr;
+      descriptorWrites[4 * i + 1].pTexelBufferView = nullptr;
+
+      descriptorWrites[4 * i + 2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      descriptorWrites[4 * i + 2].dstSet = computeDescriptorSets[i];
+      descriptorWrites[4 * i + 2].dstBinding = 2;
+      descriptorWrites[4 * i + 2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      descriptorWrites[4 * i + 2].descriptorCount = 1;
+      descriptorWrites[4 * i + 2].pBufferInfo = &numBladesBufferInfo;
+      descriptorWrites[4 * i + 2].pImageInfo = nullptr;
+      descriptorWrites[4 * i + 2].pTexelBufferView = nullptr;
+
+      descriptorWrites[4 * i + 3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      descriptorWrites[4 * i + 3].dstSet = computeDescriptorSets[i];
+      descriptorWrites[4 * i + 3].dstBinding = 3;
+      descriptorWrites[4 * i + 3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+      descriptorWrites[4 * i + 3].descriptorCount = 1;
+      descriptorWrites[4 * i + 3].pImageInfo = &depthPyramidInfo;
     }
 
     // Update descriptor sets
@@ -618,9 +699,9 @@ void Renderer::CreateGraphicsPipeline() {
     // --> Configuration per attached framebuffer
     VkPipelineColorBlendAttachmentState colorBlendAttachment = {};
     colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    colorBlendAttachment.blendEnable = VK_FALSE;
-    colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
-    colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+    colorBlendAttachment.blendEnable = VK_TRUE;
+    colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
     colorBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
     colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
     colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
@@ -630,7 +711,7 @@ void Renderer::CreateGraphicsPipeline() {
     VkPipelineColorBlendStateCreateInfo colorBlending = {};
     colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     colorBlending.logicOpEnable = VK_FALSE;
-    colorBlending.logicOp = VK_LOGIC_OP_COPY;
+    colorBlending.logicOp = VK_LOGIC_OP_AND;
     colorBlending.attachmentCount = 1;
     colorBlending.pAttachments = &colorBlendAttachment;
     colorBlending.blendConstants[0] = 0.0f;
@@ -804,7 +885,7 @@ void Renderer::CreateGrassPipeline() {
     VkPipelineColorBlendStateCreateInfo colorBlending = {};
     colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     colorBlending.logicOpEnable = VK_FALSE;
-    colorBlending.logicOp = VK_LOGIC_OP_COPY;
+    colorBlending.logicOp = VK_LOGIC_OP_AND;
     colorBlending.attachmentCount = 1;
     colorBlending.pAttachments = &colorBlendAttachment;
     colorBlending.blendConstants[0] = 0.0f;
@@ -862,6 +943,50 @@ void Renderer::CreateGrassPipeline() {
     vkDestroyShaderModule(logicalDevice, tescShaderModule, nullptr);
     vkDestroyShaderModule(logicalDevice, teseShaderModule, nullptr);
     vkDestroyShaderModule(logicalDevice, fragShaderModule, nullptr);
+}
+
+void Renderer::CreateDepthReducePipeline() {
+    VkShaderModule computeShaderModule = ShaderModule::Create("shaders/depthreduce.comp.spv", logicalDevice);
+
+    VkPipelineShaderStageCreateInfo computeShaderStageInfo = {};
+    computeShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    computeShaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    computeShaderStageInfo.module = computeShaderModule;
+    computeShaderStageInfo.pName = "main";
+
+    std::vector<VkDescriptorSetLayout> descriptorSetLayouts = { depthReduceDescriptorSetLayout };
+
+    VkPushConstantRange pushConstant;
+    pushConstant.offset = 0;
+    pushConstant.size = 2 * sizeof(float);
+    pushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo = {};
+    pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutInfo.setLayoutCount = static_cast<uint32_t>(descriptorSetLayouts.size());
+    pipelineLayoutInfo.pSetLayouts = descriptorSetLayouts.data();
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pushConstant;
+
+    if (vkCreatePipelineLayout(logicalDevice, &pipelineLayoutInfo, nullptr, &depthReducePipelineLayout) != VK_SUCCESS) {
+      throw std::runtime_error("Failed to create pipeline layout");
+    }
+
+    VkComputePipelineCreateInfo pipelineInfo = {};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipelineInfo.stage = computeShaderStageInfo;
+    pipelineInfo.layout = depthReducePipelineLayout;
+    pipelineInfo.pNext = nullptr;
+    pipelineInfo.flags = 0;
+    pipelineInfo.basePipelineHandle = VK_NULL_HANDLE;
+    pipelineInfo.basePipelineIndex = -1;
+
+    if (vkCreateComputePipelines(logicalDevice, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &depthReducePipeline) != VK_SUCCESS) {
+      throw std::runtime_error("Failed to create compute pipeline");
+    }
+
+    // No need for shader modules anymore
+    vkDestroyShaderModule(logicalDevice, computeShaderModule, nullptr);
 }
 
 void Renderer::CreateComputePipeline() {
@@ -946,8 +1071,9 @@ void Renderer::CreateFrameResources() {
         swapChain->GetVkExtent().height,
         depthFormat,
         VK_IMAGE_TILING_OPTIMAL,
-        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        1,
         depthImage,
         depthImageMemory
     );
@@ -980,6 +1106,52 @@ void Renderer::CreateFrameResources() {
         }
 
     }
+
+    // Depth Pyramid Image
+    Image::Create(device, depthPyramidWidth, depthPyramidHeight, VK_FORMAT_R32_SFLOAT, VK_IMAGE_TILING_OPTIMAL,
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, depthPyramidLevels, depthPyramid, depthPyramidMemory);
+
+    depthPyramidView = Image::CreateView(device, depthPyramid, 
+      VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, 0, depthPyramidLevels);
+
+    for (uint32_t i = 0; i < depthPyramidLevels; i++)
+    {
+      depthPyramidMips[i] = Image::CreateView(device, depthPyramid, 
+        VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, i);
+    }
+
+    // Depth Sampler
+    VkSamplerCreateInfo createInfo = {};
+
+    auto reductionMode = VK_SAMPLER_REDUCTION_MODE_MIN;
+
+    //fill the normal stuff
+    createInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    createInfo.magFilter = VK_FILTER_LINEAR;
+    createInfo.minFilter = VK_FILTER_LINEAR;
+    createInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    createInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    createInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    createInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    createInfo.minLod = 0;
+    createInfo.maxLod = 16.f;
+
+    //add a extension struct to enable Min mode
+    VkSamplerReductionModeCreateInfoEXT createInfoReduction = { VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO_EXT };
+
+    createInfoReduction.sType = VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO_EXT;
+
+    if (reductionMode != VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT)
+    {
+      createInfoReduction.reductionMode = reductionMode;
+      createInfo.pNext = &createInfoReduction;
+    }
+
+    if (vkCreateSampler(logicalDevice, &createInfo, 0, &depthSampler) != VK_SUCCESS)
+    {
+      throw std::runtime_error("Failed to create depth sampler.");
+    }
 }
 
 void Renderer::DestroyFrameResources() {
@@ -994,6 +1166,19 @@ void Renderer::DestroyFrameResources() {
     for (size_t i = 0; i < framebuffers.size(); i++) {
         vkDestroyFramebuffer(logicalDevice, framebuffers[i], nullptr);
     }
+
+
+    // Free depth pyramid related image buffers
+
+    vkDestroySampler(logicalDevice, depthSampler, nullptr);
+
+    for (size_t i = 0; i < depthPyramidLevels; i++) {
+      vkDestroyImageView(logicalDevice, depthPyramidMips[i], nullptr);
+    }
+
+    vkDestroyImageView(logicalDevice, depthPyramidView, nullptr);
+    vkFreeMemory(logicalDevice, depthPyramidMemory, nullptr);
+    vkDestroyImage(logicalDevice, depthPyramid, nullptr);
 }
 
 void Renderer::RecreateFrameResources() {
@@ -1050,6 +1235,181 @@ void Renderer::RecordComputeCommandBuffer() {
     // ~ End recording ~
     if (vkEndCommandBuffer(computeCommandBuffer) != VK_SUCCESS) {
         throw std::runtime_error("Failed to record compute command buffer");
+    }
+}
+
+void Renderer::RecordDepthReduceCommandBuffer() {
+
+    // Specify the command pool and number of buffers to allocate
+    VkCommandBufferAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = computeCommandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+
+    if (vkAllocateCommandBuffers(logicalDevice, &allocInfo, &depthReduceCommandBuffer) != VK_SUCCESS) {
+      throw std::runtime_error("Failed to allocate command buffers");
+    }
+
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+    beginInfo.pInheritanceInfo = nullptr;
+
+    // ~ Start recording ~
+    if (vkBeginCommandBuffer(depthReduceCommandBuffer, &beginInfo) != VK_SUCCESS) {
+      throw std::runtime_error("Failed to begin recording depth reduce command buffer");
+    }
+
+    {
+      VkImageMemoryBarrier barrier{};
+      barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+      barrier.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+      barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.image = depthImage;
+      barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+      barrier.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+      barrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+      barrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+      barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+      // Reduce Depth
+      vkCmdPipelineBarrier(depthReduceCommandBuffer, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, 
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT, 0, 0, 0, 0, 1, &barrier);
+    }
+
+    // Transition depthPyramid from undefined to general
+    // TODO: Double check if this is correct. 
+    {
+      VkImageMemoryBarrier barrier{};
+      barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+      barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.image = depthPyramid;
+      barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      barrier.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+      barrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+      barrier.srcAccessMask = 0;
+      barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+      // Reduce Depth
+      vkCmdPipelineBarrier(depthReduceCommandBuffer, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT, 0, 0, 0, 0, 1, &barrier);
+    }
+
+    vkCmdBindPipeline(depthReduceCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, depthReducePipeline);
+
+    for (uint32_t i = 0; i < depthPyramidLevels; ++i)
+    {
+      VkDescriptorImageInfo destTarget;
+      destTarget.sampler = depthSampler;
+      destTarget.imageView = depthPyramidMips[i];
+      destTarget.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+      VkDescriptorImageInfo sourceTarget;
+      sourceTarget.sampler = depthSampler;
+      if (i == 0)
+      {
+        sourceTarget.imageView = depthImageView;
+        sourceTarget.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      }
+      else {
+        sourceTarget.imageView = depthPyramidMips[i - 1];
+        sourceTarget.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+      }
+
+      VkDescriptorSet depthSet;
+      
+      // Describe the desciptor set
+      VkDescriptorSetLayout layouts[] = { depthReduceDescriptorSetLayout };
+      VkDescriptorSetAllocateInfo allocInfo = {};
+      allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+      allocInfo.descriptorPool = descriptorPool;
+      allocInfo.descriptorSetCount = 1;
+      allocInfo.pSetLayouts = layouts;
+
+      // Allocate descriptor sets
+      if (vkAllocateDescriptorSets(logicalDevice, &allocInfo, &depthSet) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate descriptor set");
+      }
+
+      std::vector<VkWriteDescriptorSet> descriptorWrites(2);
+      descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      descriptorWrites[0].dstSet = depthSet;
+      descriptorWrites[0].dstBinding = 0;
+      descriptorWrites[0].dstArrayElement = 0;
+      descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+      descriptorWrites[0].descriptorCount = 1;
+      descriptorWrites[0].pImageInfo = &destTarget;
+
+      descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      descriptorWrites[1].dstSet = depthSet;
+      descriptorWrites[1].dstBinding = 1;
+      descriptorWrites[1].dstArrayElement = 0;
+      descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+      descriptorWrites[1].descriptorCount = 1;
+      descriptorWrites[1].pImageInfo = &sourceTarget;
+
+      vkUpdateDescriptorSets(logicalDevice, static_cast<uint32_t>(descriptorWrites.size()), 
+        descriptorWrites.data(), 0, nullptr);
+
+      vkCmdBindDescriptorSets(depthReduceCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, 
+        depthReducePipelineLayout, 0, 1, &depthSet, 0, nullptr);
+
+      uint32_t levelWidth = depthPyramidWidth >> i;
+      uint32_t levelHeight = depthPyramidHeight >> i;
+      if (levelHeight < 1) levelHeight = 1;
+      if (levelWidth < 1) levelWidth = 1;
+
+      float reduceData[2] = { float(levelWidth), float(levelHeight) };
+
+      vkCmdPushConstants(depthReduceCommandBuffer, depthReducePipelineLayout, 
+        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(reduceData), &reduceData);
+      vkCmdDispatch(depthReduceCommandBuffer, levelWidth/32, levelHeight/32, 1);
+
+      // Reduce Barrier
+      VkImageMemoryBarrier reduceBarrier{};
+      reduceBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+      reduceBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+      reduceBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+      reduceBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      reduceBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      reduceBarrier.image = depthPyramid;
+      reduceBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      reduceBarrier.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+      reduceBarrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+      reduceBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+      reduceBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+      vkCmdPipelineBarrier(depthReduceCommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT, 0, 0, 0, 0, 1, &reduceBarrier);
+    }
+
+    {
+      VkImageMemoryBarrier barrier{};
+      barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+      barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      barrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.image = depthImage;
+      barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+      barrier.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+      barrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+      barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+      vkCmdPipelineBarrier(depthReduceCommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 
+        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, VK_DEPENDENCY_BY_REGION_BIT, 0, 0, 0, 0, 1, &barrier);
+    }
+
+    // ~ End recording ~
+    if (vkEndCommandBuffer(depthReduceCommandBuffer) != VK_SUCCESS) {
+      throw std::runtime_error("Failed to record depth reduce command buffer");
     }
 }
 
@@ -1112,25 +1472,9 @@ void Renderer::RecordCommandBuffers() {
 
         vkCmdBeginRenderPass(commandBuffers[i], &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
-        // Bind the graphics pipeline
-        vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
-
-        for (uint32_t j = 0; j < scene->GetModels().size(); ++j) {
-            // Bind the vertex and index buffers
-            VkBuffer vertexBuffers[] = { scene->GetModels()[j]->getVertexBuffer() };
-            VkDeviceSize offsets[] = { 0 };
-            vkCmdBindVertexBuffers(commandBuffers[i], 0, 1, vertexBuffers, offsets);
-
-            vkCmdBindIndexBuffer(commandBuffers[i], scene->GetModels()[j]->getIndexBuffer(), 0, VK_INDEX_TYPE_UINT32);
-
-            // Bind the descriptor set for each model
-            vkCmdBindDescriptorSets(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipelineLayout, 1, 1, &modelDescriptorSets[j], 0, nullptr);
-
-            // Draw
-            std::vector<uint32_t> indices = scene->GetModels()[j]->getIndices();
-            vkCmdDrawIndexed(commandBuffers[i], static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
-        }
-
+        // NOTE: In order to test for occlusion culling, objects will have alpha values.
+        // Therefore, we need to render the grass first which are solid objects before the models.
+        // 
         // Bind the grass pipeline
         vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, grassPipeline);
 
@@ -1147,6 +1491,25 @@ void Renderer::RecordCommandBuffers() {
             // Draw
             // TODO: Uncomment this when the buffers are populated
             vkCmdDrawIndirect(commandBuffers[i], scene->GetBlades()[j]->GetNumBladesBuffer(), 0, 1, sizeof(BladeDrawIndirect));
+        }
+
+        // Bind the graphics pipeline
+        vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
+
+        for (uint32_t j = 0; j < scene->GetModels().size(); ++j) {
+          // Bind the vertex and index buffers
+          VkBuffer vertexBuffers[] = { scene->GetModels()[j]->getVertexBuffer() };
+          VkDeviceSize offsets[] = { 0 };
+          vkCmdBindVertexBuffers(commandBuffers[i], 0, 1, vertexBuffers, offsets);
+
+          vkCmdBindIndexBuffer(commandBuffers[i], scene->GetModels()[j]->getIndexBuffer(), 0, VK_INDEX_TYPE_UINT32);
+
+          // Bind the descriptor set for each model
+          vkCmdBindDescriptorSets(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipelineLayout, 1, 1, &modelDescriptorSets[j], 0, nullptr);
+
+          // Draw
+          std::vector<uint32_t> indices = scene->GetModels()[j]->getIndices();
+          vkCmdDrawIndexed(commandBuffers[i], static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
         }
 
         // End render pass
@@ -1168,7 +1531,7 @@ void Renderer::Frame() {
     computeSubmitInfo.pCommandBuffers = &computeCommandBuffer;
 
     if (vkQueueSubmit(device->GetQueue(QueueFlags::Compute), 1, &computeSubmitInfo, VK_NULL_HANDLE) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to submit draw command buffer");
+        throw std::runtime_error("Failed to submit main compute command buffer");
     }
 
     if (!swapChain->Acquire()) {
@@ -1197,6 +1560,15 @@ void Renderer::Frame() {
         throw std::runtime_error("Failed to submit draw command buffer");
     }
 
+    VkSubmitInfo depthReduceSubmitInfo = {};
+    depthReduceSubmitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    depthReduceSubmitInfo.commandBufferCount = 1;
+    depthReduceSubmitInfo.pCommandBuffers = &depthReduceCommandBuffer;
+
+    if (vkQueueSubmit(device->GetQueue(QueueFlags::Compute), 1, &depthReduceSubmitInfo, VK_NULL_HANDLE) != VK_SUCCESS) {
+      throw std::runtime_error("Failed to submit depth reduce command buffer");
+    }
+
     if (!swapChain->Present()) {
         RecreateFrameResources();
     }
@@ -1209,19 +1581,23 @@ Renderer::~Renderer() {
 
     vkFreeCommandBuffers(logicalDevice, graphicsCommandPool, static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
     vkFreeCommandBuffers(logicalDevice, computeCommandPool, 1, &computeCommandBuffer);
+    vkFreeCommandBuffers(logicalDevice, computeCommandPool, 1, &depthReduceCommandBuffer);
     
     vkDestroyPipeline(logicalDevice, graphicsPipeline, nullptr);
     vkDestroyPipeline(logicalDevice, grassPipeline, nullptr);
     vkDestroyPipeline(logicalDevice, computePipeline, nullptr);
+    vkDestroyPipeline(logicalDevice, depthReducePipeline, nullptr);
 
     vkDestroyPipelineLayout(logicalDevice, graphicsPipelineLayout, nullptr);
     vkDestroyPipelineLayout(logicalDevice, grassPipelineLayout, nullptr);
     vkDestroyPipelineLayout(logicalDevice, computePipelineLayout, nullptr);
+    vkDestroyPipelineLayout(logicalDevice, depthReducePipelineLayout, nullptr);
 
     vkDestroyDescriptorSetLayout(logicalDevice, cameraDescriptorSetLayout, nullptr);
     vkDestroyDescriptorSetLayout(logicalDevice, modelDescriptorSetLayout, nullptr);
     vkDestroyDescriptorSetLayout(logicalDevice, timeDescriptorSetLayout, nullptr);
     vkDestroyDescriptorSetLayout(logicalDevice, computeDescriptorSetLayout, nullptr);
+    vkDestroyDescriptorSetLayout(logicalDevice, depthReduceDescriptorSetLayout, nullptr);
 
     vkDestroyDescriptorPool(logicalDevice, descriptorPool, nullptr);
 
